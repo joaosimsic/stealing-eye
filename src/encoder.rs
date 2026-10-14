@@ -1,10 +1,22 @@
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::x11::Rect;
+
+/// Put a child in its own process group so terminal signals (Ctrl-C) reach only
+/// the recorder, letting ffmpeg finalize the file cleanly.
+pub(crate) fn detach_process_group(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+}
 
 pub struct Encoder {
     child: Child,
@@ -14,18 +26,24 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn start(ffmpeg: &str, rect: Rect, fps: u32, output: &Path) -> Result<Self> {
+    pub fn start(
+        ffmpeg: &str,
+        rect: Rect,
+        fps: u32,
+        output: &Path,
+        pix_fmt: &str,
+    ) -> Result<Self> {
         let tmp_path = tmp_path_for(output);
 
-        let mut child = Command::new(ffmpeg)
-            .arg("-hide_banner")
+        let mut cmd = Command::new(ffmpeg);
+        cmd.arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
             .arg("-y")
             .arg("-f")
             .arg("rawvideo")
             .arg("-pix_fmt")
-            .arg("bgr0")
+            .arg(pix_fmt)
             .arg("-s")
             .arg(format!("{}x{}", rect.w, rect.h))
             .arg("-r")
@@ -47,7 +65,10 @@ impl Encoder {
             .arg(&tmp_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        detach_process_group(&mut cmd);
+
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning ffmpeg at '{ffmpeg}'"))?;
 
@@ -86,13 +107,17 @@ impl Encoder {
     pub fn finish(mut self) -> Result<()> {
         self.stdin.take();
         let status = self.child.wait().context("waiting for ffmpeg")?;
-        if !status.success() {
-            let _ = fs::remove_file(&self.tmp_path);
-            return Err(anyhow!("ffmpeg exited with {status}"));
-        }
         if self.frames == 0 {
             let _ = fs::remove_file(&self.tmp_path);
             return Err(anyhow!("no frames were captured"));
+        }
+        if !status.success() {
+            // ffmpeg was interrupted but we already have frames; the matroska
+            // container is still usable, so keep it rather than losing the clip.
+            eprintln!(
+                "stealing-eye: ffmpeg exited with {status}; keeping {} frame(s) captured so far",
+                self.frames
+            );
         }
         Ok(())
     }

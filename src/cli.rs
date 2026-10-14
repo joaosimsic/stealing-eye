@@ -1,4 +1,14 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// Use XComposite (stable offscreen pixmap) when available, else the root buffer.
+    Auto,
+    /// Read the raw root front buffer (tears on GL/page-flipped apps).
+    Root,
+    /// Force XComposite capture (fails if the extension is unavailable).
+    Composite,
+}
 
 /// X11 screen recorder designed for non-interactive automation.
 #[derive(Parser, Debug, Clone)]
@@ -51,10 +61,43 @@ pub struct Cli {
     /// Emit machine-readable JSON events on stdout.
     #[arg(long)]
     pub json: bool,
+
+    /// Listen for control commands on a unix socket (default path when no value).
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = crate::control::DEFAULT_SOCKET,
+    )]
+    pub control: Option<String>,
+
+    /// Read control commands as line-delimited JSON from stdin.
+    #[arg(long)]
+    pub control_stdio: bool,
+
+    /// Ignore clips shorter than this many seconds (delete the output).
+    #[arg(long, value_name = "SECS")]
+    pub min_clip: Option<f64>,
+
+    /// Force-stop a clip after this many seconds.
+    #[arg(long, value_name = "SECS")]
+    pub max_clip: Option<f64>,
+
+    /// Stop a clip after this many seconds with no pixel change (XDamage).
+    #[arg(long, value_name = "SECS")]
+    pub idle_stop: Option<f64>,
+
+    /// Capture backend.
+    #[arg(long, value_enum, default_value_t = CaptureMode::Auto)]
+    pub capture: CaptureMode,
 }
 
 impl Cli {
     pub fn audio_enabled(&self) -> bool {
         self.audio && !self.no_audio
+    }
+
+    pub fn control_enabled(&self) -> bool {
+        self.control.is_some() || self.control_stdio
     }
 }

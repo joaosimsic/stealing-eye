@@ -5,7 +5,12 @@ use x11rb::protocol::shm::X11_EXTENSION_NAME as SHM_NAME;
 use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 
-use crate::cli::Cli;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Target {
+    Window(Window),
+    Root,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rect {
@@ -64,34 +69,57 @@ impl X11 {
         })
     }
 
-    pub fn resolve_region(&self, cli: &Cli) -> Result<Rect> {
-        if let Some(spec) = &cli.region {
-            let mut rect = parse_region(spec).context("parsing --region")?;
+    /// Resolve a capture target to a root-relative rect plus what to capture.
+    pub fn resolve_target(
+        &self,
+        region: Option<&str>,
+        window: Option<&str>,
+        window_name: Option<&str>,
+    ) -> Result<(Rect, Target)> {
+        if let Some(spec) = region {
+            let mut rect = parse_region(spec).context("parsing region")?;
             self.clamp(&mut rect);
-            return Ok(rect);
+            return Ok((rect, Target::Root));
         }
 
-        if let Some(id) = &cli.window {
-            let win = parse_window_id(id).context("parsing --window")?;
-            return self.window_rect(win);
+        if let Some(id) = window {
+            let win = parse_window_id(id).context("parsing window id")?;
+            let mut rect = self.window_rect(win)?;
+            self.clamp(&mut rect);
+            return Ok((rect, Target::Window(win)));
         }
 
-        if let Some(pat) = &cli.window_name {
+        if let Some(pat) = window_name {
             let win = self.find_window_by_name(pat)?;
-            return self.window_rect(win);
+            let mut rect = self.window_rect(win)?;
+            self.clamp(&mut rect);
+            return Ok((rect, Target::Window(win)));
         }
 
-        Ok(Rect {
-            x: 0,
-            y: 0,
-            w: self.root_width,
-            h: self.root_height,
-        })
+        Ok((
+            Rect {
+                x: 0,
+                y: 0,
+                w: self.root_width,
+                h: self.root_height,
+            },
+            Target::Root,
+        ))
     }
 
     fn clamp(&self, rect: &mut Rect) {
-        rect.w = rect.w.min(self.root_width.saturating_sub(rect.x.max(0) as u16));
-        rect.h = rect.h.min(self.root_height.saturating_sub(rect.y.max(0) as u16));
+        if rect.x < 0 {
+            let cut = (-rect.x) as u16;
+            rect.w = rect.w.saturating_sub(cut);
+            rect.x = 0;
+        }
+        if rect.y < 0 {
+            let cut = (-rect.y) as u16;
+            rect.h = rect.h.saturating_sub(cut);
+            rect.y = 0;
+        }
+        rect.w = rect.w.min(self.root_width.saturating_sub(rect.x as u16));
+        rect.h = rect.h.min(self.root_height.saturating_sub(rect.y as u16));
     }
 
     fn window_rect(&self, win: Window) -> Result<Rect> {

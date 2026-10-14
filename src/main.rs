@@ -1,21 +1,25 @@
 mod audio;
 mod capture;
 mod cli;
+mod control;
 mod encoder;
+mod idle;
 mod output;
 mod x11;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use serde_json::json;
+use serde_json::{json, Value};
 
-use cli::Cli;
+use cli::{CaptureMode, Cli};
+use control::{Command as Ctrl, Hub};
 use output::{exit, Reporter};
 
 fn main() {
@@ -25,7 +29,9 @@ fn main() {
 
 fn run() -> i32 {
     let cli = Cli::parse();
-    let rep = Reporter::new(cli.json);
+    let control_enabled = cli.control_enabled();
+
+    let rep = Reporter::new(cli.json && !cli.control_stdio);
 
     if cli.list_windows {
         return match list_windows() {
@@ -41,12 +47,43 @@ fn run() -> i32 {
         return code;
     }
 
-    match record(&cli, &rep) {
-        Ok(frames) => {
-            rep.event("stop", json!({ "frames": frames, "output": cli.output }));
-            rep.log(&format!("wrote {} ({frames} frames)", cli.output));
-            exit::OK
+    let x = match x11::X11::connect() {
+        Ok(x) => x,
+        Err(e) => {
+            rep.log(&format!("{e:#}"));
+            return exit::X_CONNECT;
         }
+    };
+    if !x.shm_available {
+        rep.log("MIT-SHM extension unavailable on this X server");
+        return exit::X_CONNECT;
+    }
+
+    let stop_all = Arc::new(AtomicBool::new(false));
+    {
+        let stop_all = stop_all.clone();
+        let _ = ctrlc::set_handler(move || stop_all.store(true, Ordering::SeqCst));
+    }
+
+    if !control_enabled {
+        return run_one_shot(&x, &cli, &rep, &stop_all);
+    }
+
+    run_supervisor(&x, &cli, &rep, &stop_all)
+}
+
+fn run_one_shot(x: &x11::X11, cli: &Cli, rep: &Reporter, stop_all: &AtomicBool) -> i32 {
+    let spec = SessionSpec {
+        window: cli.window.clone(),
+        window_name: cli.window_name.clone(),
+        region: cli.region.clone(),
+        label: None,
+        index: 1,
+    };
+    let max_clip = cli.duration.or(cli.max_clip).map(Duration::from_secs_f64);
+
+    match run_session(x, cli, rep, None, None, stop_all, max_clip, &spec) {
+        Ok(()) => exit::OK,
         Err(fail) => {
             rep.log(&format!("{:#}", fail.err));
             fail.code
@@ -54,17 +91,359 @@ fn run() -> i32 {
     }
 }
 
-struct RecordFail {
+fn run_supervisor(x: &x11::X11, cli: &Cli, rep: &Reporter, stop_all: &AtomicBool) -> i32 {
+    let hub = Hub::new();
+    let ctl = match control::start(cli.control.as_deref(), cli.control_stdio, &hub) {
+        Ok(c) => c,
+        Err(e) => {
+            rep.log(&format!("{e:#}"));
+            return exit::USAGE;
+        }
+    };
+
+    hub.emit(
+        "ready",
+        json!({ "socket": cli.control, "stdio": cli.control_stdio, "fps": cli.fps }),
+    );
+    rep.log("control mode: waiting for commands");
+
+    let max_clip = cli.max_clip.map(Duration::from_secs_f64);
+    let mut index: u32 = 0;
+    let mut last_code = exit::OK;
+
+    loop {
+        if stop_all.load(Ordering::SeqCst) {
+            break;
+        }
+        match ctl.rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ctrl::Start {
+                window,
+                window_name,
+                region,
+                label,
+            }) => {
+                index += 1;
+                let spec = SessionSpec {
+                    window: window.or_else(|| cli.window.clone()),
+                    window_name: window_name.or_else(|| cli.window_name.clone()),
+                    region: region.or_else(|| cli.region.clone()),
+                    label,
+                    index,
+                };
+                if let Err(fail) = run_session(
+                    x,
+                    cli,
+                    rep,
+                    Some(&hub),
+                    Some(&ctl.rx),
+                    stop_all,
+                    max_clip,
+                    &spec,
+                ) {
+                    rep.log(&format!("{:#}", fail.err));
+                    last_code = fail.code;
+                }
+            }
+            Ok(Ctrl::Stop) => hub.emit("idle", json!({ "message": "not recording" })),
+            Ok(Ctrl::Status) => hub.emit(
+                "status",
+                json!({ "recording": false, "sessions": index, "output": cli.output }),
+            ),
+            Ok(Ctrl::Shutdown) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    last_code
+}
+
+struct SessionSpec {
+    window: Option<String>,
+    window_name: Option<String>,
+    region: Option<String>,
+    label: Option<String>,
+    index: u32,
+}
+
+struct SessionFail {
     code: i32,
     err: anyhow::Error,
 }
 
-impl From<anyhow::Error> for RecordFail {
+impl From<anyhow::Error> for SessionFail {
     fn from(err: anyhow::Error) -> Self {
-        RecordFail {
+        SessionFail {
             code: exit::FFMPEG,
             err,
         }
+    }
+}
+
+fn emit(rep: &Reporter, hub: Option<&Hub>, event: &str, fields: Value) {
+    rep.event(event, fields.clone());
+    if let Some(hub) = hub {
+        hub.emit(event, fields);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    x: &x11::X11,
+    cli: &Cli,
+    rep: &Reporter,
+    hub: Option<&Hub>,
+    rx: Option<&Receiver<Ctrl>>,
+    stop_all: &AtomicBool,
+    max_clip: Option<Duration>,
+    spec: &SessionSpec,
+) -> Result<(), SessionFail> {
+    let (root_rect, target) = x
+        .resolve_target(
+            spec.region.as_deref(),
+            spec.window.as_deref(),
+            spec.window_name.as_deref(),
+        )
+        .context("resolving capture target")?;
+
+    let out_path = suffixed_path(Path::new(&cli.output), spec.index);
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+    }
+
+    let (capturer, pix_fmt) = build_capturer(x, cli, target, root_rect, rep)?;
+    let rect = capturer.rect();
+
+    emit(
+        rep,
+        hub,
+        "start",
+        json!({
+            "index": spec.index,
+            "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h,
+            "fps": cli.fps, "output": out_path, "audio": cli.audio_enabled(),
+            "capture": format!("{:?}", cli.capture),
+            "label": spec.label,
+        }),
+    );
+
+    let audio = if cli.audio_enabled() {
+        Some(
+            audio::AudioRecorder::start(cli.audio_device.clone())
+                .context("starting audio")
+                .map_err(|err| SessionFail {
+                    code: exit::AUDIO,
+                    err,
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let mut enc = encoder::Encoder::start(&cli.ffmpeg, rect, cli.fps, &out_path, &pix_fmt)?;
+
+    let mut idle = match cli.idle_stop {
+        Some(secs) => {
+            let (drawable, region) = match target {
+                x11::Target::Window(w) => (w, None),
+                x11::Target::Root => (x.root, Some(rect)),
+            };
+            match idle::IdleWatcher::start(drawable, region, Duration::from_secs_f64(secs)) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    rep.log(&format!("idle-stop unavailable: {e:#}"));
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let frame_dur = Duration::from_secs_f64(1.0 / cli.fps as f64);
+    let deadline = max_clip.map(|d| Instant::now() + d);
+    let start = Instant::now();
+    let mut count: u64 = 0;
+    let mut session_stop = false;
+
+    loop {
+        if stop_all.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Some(rx) = rx {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    Ctrl::Stop => session_stop = true,
+                    Ctrl::Shutdown => {
+                        session_stop = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if session_stop {
+            break;
+        }
+        if idle.as_ref().map(|i| i.fired()).unwrap_or(false) {
+            break;
+        }
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                break;
+            }
+        }
+
+        match capturer.frame() {
+            Ok(frame) => enc.write_frame(frame)?,
+            Err(e) => {
+                rep.log(&format!("capture stopped: {e:#}"));
+                break;
+            }
+        }
+        count += 1;
+
+        let next = start + frame_dur * (count as u32);
+        let now = Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        }
+    }
+
+    if let Some(mut i) = idle.take() {
+        i.stop();
+    }
+
+    let frames = enc.frames();
+    let tmp = enc.tmp_path().to_path_buf();
+    enc.finish().context("finalizing video")?;
+
+    if let Some(rec) = audio {
+        let wav = out_path.with_extension("wav");
+        rec.stop_and_write(&wav).context("finalizing audio")?;
+        mux(&cli.ffmpeg, &tmp, &wav, &out_path).context("muxing audio")?;
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&wav);
+    } else {
+        std::fs::rename(&tmp, &out_path)
+            .with_context(|| format!("moving {} to {}", tmp.display(), out_path.display()))?;
+    }
+
+    let duration = frames as f64 / cli.fps as f64;
+    let discarded = cli.min_clip.map(|m| duration < m).unwrap_or(false);
+    if discarded {
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    emit(
+        rep,
+        hub,
+        "stop",
+        json!({
+            "index": spec.index,
+            "frames": frames,
+            "duration": duration,
+            "output": out_path,
+            "discarded": discarded,
+        }),
+    );
+    rep.log(&format!("wrote {} ({frames} frames)", out_path.display()));
+
+    Ok(())
+}
+
+fn build_capturer<'a>(
+    x: &'a x11::X11,
+    cli: &Cli,
+    target: x11::Target,
+    root_rect: x11::Rect,
+    rep: &Reporter,
+) -> Result<(capture::ShmCapturer<'a>, String), SessionFail> {
+    let composite_ok = capture::composite_available(&x.conn);
+    let want_composite = match cli.capture {
+        CaptureMode::Root => false,
+        CaptureMode::Composite => true,
+        CaptureMode::Auto => composite_ok,
+    };
+
+    if want_composite && composite_ok {
+        let attempt = match target {
+            x11::Target::Window(win) => {
+                capture::ShmCapturer::composite_window(&x.conn, win, x.bits_per_pixel)
+                    .map(|(c, depth)| (c, pix_fmt_for_depth(depth)))
+            }
+            x11::Target::Root => {
+                capture::ShmCapturer::composite_root(&x.conn, x.root, root_rect, x.bits_per_pixel)
+                    .map(|(c, depth)| (c, pix_fmt_for_depth(depth)))
+            }
+        };
+        match attempt {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if cli.capture == CaptureMode::Composite {
+                    return Err(e.into());
+                }
+                rep.log(&format!(
+                    "composite capture unavailable ({e:#}); falling back to root"
+                ));
+            }
+        }
+    } else if cli.capture == CaptureMode::Composite {
+        return Err(anyhow!("XComposite extension unavailable on this X server").into());
+    }
+
+    let capturer = capture::ShmCapturer::root(&x.conn, x.root, root_rect, x.bits_per_pixel)?;
+    Ok((capturer, "bgr0".to_string()))
+}
+
+fn pix_fmt_for_depth(depth: u8) -> String {
+    if depth >= 32 {
+        "bgra".to_string()
+    } else {
+        "bgr0".to_string()
+    }
+}
+
+fn mux(ffmpeg: &str, video: &Path, audio: &Path, out: &Path) -> Result<()> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(video)
+        .arg("-i")
+        .arg(audio)
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-af")
+        .arg("apad")
+        .arg("-shortest")
+        .arg(out);
+    encoder::detach_process_group(&mut cmd);
+    let status = cmd.status().context("spawning ffmpeg mux")?;
+    if !status.success() {
+        return Err(anyhow!("ffmpeg mux exited with {status}"));
+    }
+    Ok(())
+}
+
+fn suffixed_path(base: &Path, index: u32) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "recording".to_string());
+    let ext = base
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mp4".to_string());
+    let name = format!("{stem}-{index}.{ext}");
+    match base.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => PathBuf::from(name),
     }
 }
 
@@ -89,123 +468,5 @@ fn validate(cli: &Cli, rep: &Reporter) -> Result<(), i32> {
         return Err(exit::FFMPEG);
     }
 
-    Ok(())
-}
-
-fn record(cli: &Cli, rep: &Reporter) -> Result<u64, RecordFail> {
-    let x = x11::X11::connect().context("connecting to X")?;
-    if !x.shm_available {
-        return Err(anyhow!("MIT-SHM extension unavailable on this X server").into());
-    }
-
-    let rect = x.resolve_region(cli)?;
-
-    if let Some(parent) = Path::new(&cli.output).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating output directory {}", parent.display()))?;
-        }
-    }
-
-    rep.event(
-        "start",
-        json!({
-            "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h,
-            "fps": cli.fps, "output": cli.output, "audio": cli.audio_enabled(),
-        }),
-    );
-
-    let audio = if cli.audio_enabled() {
-        Some(
-            audio::AudioRecorder::start(cli.audio_device.clone())
-                .context("starting audio")
-                .map_err(|err| RecordFail {
-                    code: exit::AUDIO,
-                    err,
-                })?,
-        )
-    } else {
-        None
-    };
-
-    let out_path = Path::new(&cli.output);
-    let mut enc = encoder::Encoder::start(&cli.ffmpeg, rect, cli.fps, out_path)?;
-    let capturer = capture::ShmCapturer::new(&x.conn, x.root, rect, x.bits_per_pixel)?;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
-    }
-
-    let frame_dur = Duration::from_secs_f64(1.0 / cli.fps as f64);
-    let deadline = cli
-        .duration
-        .map(|d| Instant::now() + Duration::from_secs_f64(d));
-    let start = Instant::now();
-    let mut count: u64 = 0;
-
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                break;
-            }
-        }
-
-        let frame = capturer.frame()?;
-        enc.write_frame(frame)?;
-        count += 1;
-
-        let next = start + frame_dur * (count as u32);
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
-        }
-    }
-
-    let frames = enc.frames();
-    let tmp = enc.tmp_path().to_path_buf();
-    enc.finish().context("finalizing video")?;
-
-    if let Some(rec) = audio {
-        let wav = out_path.with_extension("wav");
-        rec.stop_and_write(&wav).context("finalizing audio")?;
-        mux(&cli.ffmpeg, &tmp, &wav, out_path).context("muxing audio")?;
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&wav);
-    } else {
-        std::fs::rename(&tmp, out_path)
-            .with_context(|| format!("moving {} to {}", tmp.display(), out_path.display()))?;
-    }
-
-    Ok(frames)
-}
-
-fn mux(ffmpeg: &str, video: &Path, audio: &Path, out: &Path) -> Result<()> {
-    let status = Command::new(ffmpeg)
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-y")
-        .arg("-i")
-        .arg(video)
-        .arg("-i")
-        .arg(audio)
-        .arg("-c:v")
-        .arg("copy")
-        .arg("-c:a")
-        .arg("aac")
-        .arg("-af")
-        .arg("apad")
-        .arg("-shortest")
-        .arg(out)
-        .status()
-        .context("spawning ffmpeg mux")?;
-    if !status.success() {
-        return Err(anyhow!("ffmpeg mux exited with {status}"));
-    }
     Ok(())
 }

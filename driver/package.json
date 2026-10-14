@@ -1,0 +1,14 @@
+{
+  "name": "stealing-eye-driver",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright Firefox <video> detector that drives stealing-eye over its control socket",
+  "main": "record.js",
+  "scripts": {
+    "install:browsers": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install firefox",
+    "record": "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 node record.js"
+  },
+  "dependencies": {
+    "playwright": "^1.0.0"
+  }
+}

@@ -1,1 +1,6 @@
 /target
+driver/node_modules/
+driver/.playwright-browsers/
+*.mp4
+*.mkv
+*.wav
