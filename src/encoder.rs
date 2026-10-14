@@ -26,13 +26,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn start(
-        ffmpeg: &str,
-        rect: Rect,
-        fps: u32,
-        output: &Path,
-        pix_fmt: &str,
-    ) -> Result<Self> {
+    pub fn start(ffmpeg: &str, rect: Rect, fps: u32, output: &Path, pix_fmt: &str) -> Result<Self> {
         let tmp_path = tmp_path_for(output);
 
         let mut cmd = Command::new(ffmpeg);
@@ -112,8 +106,8 @@ impl Encoder {
             return Err(anyhow!("no frames were captured"));
         }
         if !status.success() {
-            // ffmpeg was interrupted but we already have frames; the matroska
-            // container is still usable, so keep it rather than losing the clip.
+            // ffmpeg was interrupted but we already have frames; the container
+            // is still usable, so keep it rather than losing the clip.
             eprintln!(
                 "stealing-eye: ffmpeg exited with {status}; keeping {} frame(s) captured so far",
                 self.frames
@@ -128,6 +122,8 @@ pub fn tmp_path_for(output: &Path) -> PathBuf {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "recording".to_string());
+    // Always a crash-tolerant Matroska temp; the final container is produced by
+    // remuxing/muxing on stop, so an interrupted recording is never lost.
     output.with_file_name(format!(".{stem}.{}.tmp.mkv", std::process::id()))
 }
 

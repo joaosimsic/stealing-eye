@@ -270,7 +270,7 @@ fn run_session(
     let budget = cli
         .sync_budget_ms
         .map(Duration::from_millis)
-        .unwrap_or_else(|| (frame_dur / 2).min(Duration::from_millis(15)));
+        .unwrap_or_else(|| (frame_dur * 2 / 3).min(Duration::from_millis(25)));
 
     let mut present_watch = if cli.sync == SyncMode::Present {
         match target {
@@ -364,15 +364,23 @@ fn run_session(
         // Emit at the fixed frame rate.
         if now >= next_emit {
             if stable {
-                match stabilize(&capturer, &mut buffer, &mut have_frame, budget, stop_all) {
-                    Ok(true) => {}
+                let allow_live = unsettled >= 3;
+                match stabilize(
+                    &capturer,
+                    &mut buffer,
+                    &mut have_frame,
+                    budget,
+                    allow_live,
+                    stop_all,
+                ) {
+                    Ok(true) => unsettled = 0,
                     Ok(false) => unsettled += 1,
                     Err(e) => {
                         rep.log(&format!("capture stopped: {e:#}"));
                         break;
                     }
                 }
-            } else if !have_frame {
+            } else if cli.sync == SyncMode::Timer || !have_frame {
                 match capturer.frame() {
                     Ok(frame) => {
                         buffer.clear();
@@ -431,8 +439,8 @@ fn run_session(
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&wav);
     } else {
-        std::fs::rename(&tmp, &out_path)
-            .with_context(|| format!("moving {} to {}", tmp.display(), out_path.display()))?;
+        remux(&cli.ffmpeg, &tmp, &out_path).context("remuxing video")?;
+        let _ = std::fs::remove_file(&tmp);
     }
 
     let duration = frames as f64 / cli.fps as f64;
@@ -480,28 +488,11 @@ fn build_capturer<'a>(
         return Ok((capturer, "bgr0".to_string()));
     }
 
-    let compositor = x.compositor_present();
-
-    // With a compositor running, the composited root is an atomically presented
-    // frame: crop it (window or region) instead of redirecting windows ourselves.
-    if compositor || matches!(target, x11::Target::Root) {
-        match capture::ShmCapturer::composite_root(&x.conn, x.root, root_rect, x.bits_per_pixel) {
-            Ok((c, depth)) => {
-                rep.log(if compositor { "capture backend: composited root" } else { "capture backend: composited root (no compositor)" });
-                return Ok((c, pix_fmt_for_depth(depth)));
-            }
-            Err(e) => {
-                if cli.capture == CaptureMode::Composite {
-                    return Err(e.into());
-                }
-                if compositor {
-                    rep.log(&format!("root composite unavailable ({e:#}); trying window"));
-                }
-            }
-        }
-    }
-
-    // No compositor: redirect the target window and read its own pixmap.
+    // Window target: redirect the window and read its own pixmap. The server (or
+    // a compositor) fills that pixmap per completed client frame, so it is
+    // occlusion-free. (The root window cannot be redirected/named under
+    // XComposite, so for region/full-screen targets we read the root front buffer
+    // below, which already holds the composited output when a compositor runs.)
     if let x11::Target::Window(win) = target {
         match capture::ShmCapturer::composite_window(&x.conn, win, x.bits_per_pixel) {
             Ok((c, depth)) => {
@@ -519,35 +510,60 @@ fn build_capturer<'a>(
         }
     }
 
-    rep.log("capture backend: root buffer");
+    let composited = x.compositor_present();
+    rep.log(if composited {
+        "capture backend: root buffer (composited output)"
+    } else {
+        "capture backend: root buffer"
+    });
     let capturer = capture::ShmCapturer::root(&x.conn, x.root, root_rect, x.bits_per_pixel)?;
     Ok((capturer, "bgr0".to_string()))
 }
 
+/// Grab a coherent frame: replace `buffer` only once two consecutive reads
+/// match, i.e. the client finished drawing and stopped touching the pixmap.
+/// On timeout keep the previously settled frame instead of emitting a
+/// mid-update one, which shows up as ghosting/trailing behind moving content.
+/// `allow_live` is set by the caller after several consecutive timeouts so that
+/// content which never settles (e.g. 60 Hz animation) still advances instead of
+/// freezing on the last settled frame.
 fn stabilize(
     capturer: &capture::ShmCapturer,
     buffer: &mut Vec<u8>,
     have_frame: &mut bool,
     budget: Duration,
+    allow_live: bool,
     stop_all: &AtomicBool,
 ) -> Result<bool> {
     let start = Instant::now();
+    let mut latest: Vec<u8> = Vec::new();
     loop {
         let frame = capturer.frame()?;
         if *have_frame && frame == buffer.as_slice() {
             return Ok(true);
         }
-        buffer.clear();
-        buffer.extend_from_slice(frame);
-        *have_frame = true;
-        if stop_all.load(Ordering::SeqCst) {
+        if !latest.is_empty() && frame == latest.as_slice() {
+            buffer.clear();
+            buffer.extend_from_slice(frame);
+            *have_frame = true;
             return Ok(true);
         }
+        latest.clear();
+        latest.extend_from_slice(frame);
+        if stop_all.load(Ordering::SeqCst) {
+            break;
+        }
         if start.elapsed() >= budget {
-            return Ok(false);
+            break;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    if !*have_frame || allow_live {
+        buffer.clear();
+        buffer.extend_from_slice(&latest);
+        *have_frame = true;
+    }
+    Ok(false)
 }
 
 fn signal_seq(
@@ -579,6 +595,25 @@ fn pix_fmt_for_depth(depth: u8) -> String {
     } else {
         "bgr0".to_string()
     }
+}
+
+fn remux(ffmpeg: &str, video: &Path, out: &Path) -> Result<()> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(video)
+        .arg("-c")
+        .arg("copy")
+        .arg(out);
+    encoder::detach_process_group(&mut cmd);
+    let status = cmd.status().context("spawning ffmpeg remux")?;
+    if !status.success() {
+        return Err(anyhow!("ffmpeg remux exited with {status}"));
+    }
+    Ok(())
 }
 
 fn mux(ffmpeg: &str, video: &Path, audio: &Path, out: &Path) -> Result<()> {

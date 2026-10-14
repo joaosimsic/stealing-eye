@@ -10,7 +10,6 @@ use crate::x11::Rect;
 
 enum Unredirect {
     Window(Window),
-    Subwindows(Window),
 }
 
 struct CompositeCleanup {
@@ -36,11 +35,7 @@ impl<'a> ShmCapturer<'a> {
     }
 
     /// Capture a window from its own composite pixmap (stable, occlusion-free).
-    pub fn composite_window(
-        conn: &'a RustConnection,
-        win: Window,
-        bpp: u8,
-    ) -> Result<(Self, u8)> {
+    pub fn composite_window(conn: &'a RustConnection, win: Window, bpp: u8) -> Result<(Self, u8)> {
         let pixmap = composite_setup(conn, win, true)?;
         let geom = conn
             .get_geometry(pixmap)?
@@ -60,31 +55,6 @@ impl<'a> ShmCapturer<'a> {
             Some(CompositeCleanup {
                 pixmap,
                 unredirect: Unredirect::Window(win),
-            }),
-        )?;
-        Ok((capturer, geom.depth))
-    }
-
-    /// Capture a region of the composited root pixmap (stable, no tearing).
-    pub fn composite_root(
-        conn: &'a RustConnection,
-        root: Window,
-        rect: Rect,
-        bpp: u8,
-    ) -> Result<(Self, u8)> {
-        let pixmap = composite_setup(conn, root, false)?;
-        let geom = conn
-            .get_geometry(pixmap)?
-            .reply()
-            .context("get_geometry on root pixmap")?;
-        let capturer = Self::build(
-            conn,
-            pixmap,
-            rect,
-            bpp,
-            Some(CompositeCleanup {
-                pixmap,
-                unredirect: Unredirect::Subwindows(root),
             }),
         )?;
         Ok((capturer, geom.depth))
@@ -111,7 +81,10 @@ impl<'a> ShmCapturer<'a> {
 
         let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, size, libc::IPC_CREAT | 0o600) };
         if shmid < 0 {
-            return Err(anyhow!("shmget failed: {}", std::io::Error::last_os_error()));
+            return Err(anyhow!(
+                "shmget failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         let ptr = unsafe { libc::shmat(shmid, ptr::null(), 0) } as *mut u8;
@@ -176,12 +149,9 @@ impl Drop for ShmCapturer<'_> {
             let _ = self.conn.free_pixmap(c.pixmap);
             match c.unredirect {
                 Unredirect::Window(win) => {
-                    let _ = self.conn.composite_unredirect_window(win, Redirect::AUTOMATIC);
-                }
-                Unredirect::Subwindows(root) => {
                     let _ = self
                         .conn
-                        .composite_unredirect_subwindows(root, Redirect::AUTOMATIC);
+                        .composite_unredirect_window(win, Redirect::AUTOMATIC);
                 }
             }
             let _ = self.conn.flush();
