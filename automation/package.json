@@ -1,0 +1,22 @@
+{
+  "name": "stealing-eye-automation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright automation that logs in from .env and drives the stealing-eye recorder",
+  "main": "src/record.ts",
+  "scripts": {
+    "install:browsers": "PLAYWRIGHT_BROWSERS_PATH=0 playwright install firefox",
+    "login": "PLAYWRIGHT_BROWSERS_PATH=0 PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 tsx src/login.ts",
+    "record": "PLAYWRIGHT_BROWSERS_PATH=0 PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 tsx src/record.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,6 +1,8 @@
 /target
-driver/node_modules/
-driver/.playwright-browsers/
+automation/node_modules/
+automation/.playwright-browsers/
+.env
+automation/.env
 *.mp4
 *.mkv
 *.wav

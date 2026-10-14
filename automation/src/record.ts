@@ -1,15 +1,26 @@
 #!/usr/bin/env node
-"use strict";
+import { execFileSync } from "child_process";
+import { Page } from "playwright";
+import { Control, Credentials, envCredentials, launchBrowser, login } from "./shared";
 
-// Keep the Playwright browser download inside this repo's node_modules.
-process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "0";
+interface Opts {
+  socket: string;
+  url: string | null;
+  minDuration: number;
+  minAreaRatio: number;
+  stopDebounceMs: number;
+}
 
-const net = require("net");
-const { execFileSync } = require("child_process");
-const { firefox } = require("playwright");
+interface Signal {
+  type: "play" | "pause" | "ended";
+  id: number;
+  duration?: number;
+  title?: string;
+  src?: string;
+}
 
-function parseArgs(argv) {
-  const opts = {
+function parseArgs(argv: string[]): Opts {
+  const opts: Opts = {
     socket: process.env.SE_CONTROL || "/tmp/stealing-eye.sock",
     url: null,
     minDuration: 20,
@@ -28,40 +39,7 @@ function parseArgs(argv) {
   return opts;
 }
 
-class Control {
-  constructor(path) {
-    this.path = path;
-    this.socket = null;
-    this.buffer = "";
-  }
-  connect() {
-    return new Promise((resolve, reject) => {
-      const s = net.createConnection(this.path);
-      s.on("connect", () => {
-        this.socket = s;
-        resolve();
-      });
-      s.on("error", reject);
-      s.on("data", (d) => this.onData(d));
-    });
-  }
-  onData(d) {
-    this.buffer += d.toString();
-    let idx;
-    while ((idx = this.buffer.indexOf("\n")) >= 0) {
-      const line = this.buffer.slice(0, idx);
-      this.buffer = this.buffer.slice(idx + 1);
-      if (line.trim()) console.log("<-", line);
-    }
-  }
-  send(cmd) {
-    const line = JSON.stringify(cmd) + "\n";
-    console.log("->", line.trim());
-    if (this.socket) this.socket.write(line);
-  }
-}
-
-const INIT_SCRIPT = (minDuration, minArea) => `
+const INIT_SCRIPT = (minDuration: number, minArea: number): string => `
 (() => {
   const send = (msg) => { try { window.__seSignal && window.__seSignal(msg); } catch (e) {} };
   const ids = new WeakMap();
@@ -90,18 +68,21 @@ const INIT_SCRIPT = (minDuration, minArea) => `
 })();
 `;
 
-function findFirefoxWindow(titleHint) {
-  let out;
+function findFirefoxWindow(titleHint?: string): string | null {
+  let out: string;
   try {
     out = execFileSync("wmctrl", ["-l"], { encoding: "utf8" });
   } catch {
     return null;
   }
-  const lines = out.split("\n").filter(Boolean);
-  const rows = lines.map((l) => {
-    const m = l.match(/^(0x[0-9a-fA-F]+)\s+\S+\s+\S+\s+(.*)$/);
-    return m ? { id: m[1], title: m[2] } : null;
-  }).filter(Boolean);
+  const rows = out
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => {
+      const m = l.match(/^(0x[0-9a-fA-F]+)\s+\S+\s+\S+\s+(.*)$/);
+      return m ? { id: m[1], title: m[2] } : null;
+    })
+    .filter((r): r is { id: string; title: string } => r !== null);
   const hint = (titleHint || "").toLowerCase();
   const byHint = rows.find((r) => hint && r.title.toLowerCase().includes(hint));
   if (byHint) return byHint.id;
@@ -109,38 +90,39 @@ function findFirefoxWindow(titleHint) {
   return firefox ? firefox.id : null;
 }
 
-async function main() {
+async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
+  const creds: Credentials = envCredentials();
+  const hasCreds = Boolean(creds.username && creds.password);
   const control = new Control(opts.socket);
 
+  let connected = true;
   try {
     await control.connect();
+    console.log(`connected to ${opts.socket}`);
   } catch (e) {
-    console.error(`cannot connect to stealing-eye socket ${opts.socket}: ${e.message}`);
-    process.exit(1);
+    if (!hasCreds) {
+      console.error(`cannot connect to stealing-eye socket ${opts.socket}: ${(e as Error).message}`);
+      process.exit(1);
+    }
+    connected = false;
+    console.warn(
+      `cannot connect to stealing-eye socket ${opts.socket} (${(e as Error).message}); continuing in login-only mode`
+    );
   }
-  console.log(`connected to ${opts.socket}`);
 
-  const browser = await firefox.launch({
-    headless: false,
-    firefoxUserPrefs: {
-      "media.autoplay.default": 0,
-      "media.autoplay.blocking_policy": 0,
-      "media.autoplay.allow-muted": true,
-    },
-  });
-
+  const browser = await launchBrowser();
   const context = await browser.newContext();
-  await context.exposeBinding("__seSignal", (source, payload) => {
+  await context.exposeBinding("__seSignal", (_source, payload: Signal) => {
     handleSignal(payload);
   });
   await context.addInitScript(INIT_SCRIPT(opts.minDuration, opts.minAreaRatio));
 
-  const playing = new Set();
+  const playing = new Set<number>();
   let recording = false;
-  let stopTimer = null;
+  let stopTimer: NodeJS.Timeout | null = null;
 
-  function handleSignal(payload) {
+  function handleSignal(payload: Signal): void {
     if (!payload || !payload.type) return;
     const id = payload.id;
     if (payload.type === "play") {
@@ -174,8 +156,12 @@ async function main() {
     }
   }
 
+  const url = opts.url || creds.url;
   const page = await context.newPage();
-  if (opts.url) await page.goto(opts.url, { waitUntil: "domcontentloaded" });
+  if (url) {
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+    if (hasCreds) await login(page, creds);
+  }
 
   page.on("close", () => {
     if (recording) {
@@ -187,7 +173,7 @@ async function main() {
   const shutdown = () => {
     try {
       if (recording) control.send({ cmd: "stop" });
-      control.send({ cmd: "shutdown" });
+      if (connected) control.send({ cmd: "shutdown" });
     } catch {}
     browser.close().finally(() => process.exit(0));
   };
