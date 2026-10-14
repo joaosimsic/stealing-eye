@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { execFileSync } from "child_process";
 import { Page } from "playwright";
-import { Control, Credentials, envCredentials, launchBrowser, login } from "./shared";
+import { Control, Credentials, envCredentials, envLoginOptions, launchBrowser } from "./shared";
+import { runLoginMachine } from "./machines/login";
 
 interface Opts {
   socket: string;
@@ -159,8 +160,14 @@ async function main(): Promise<void> {
   const url = opts.url || creds.url;
   const page = await context.newPage();
   if (url) {
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-    if (hasCreds) await login(page, creds);
+    if (hasCreds) {
+      const finalState = await runLoginMachine({ page, creds, url, opts: envLoginOptions() });
+      if (finalState !== "AUTHENTICATED") {
+        console.warn(`login ended in ${finalState}; watching anyway (Ctrl-C to quit)`);
+      }
+    } else {
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+    }
   }
 
   page.on("close", () => {

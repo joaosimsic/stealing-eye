@@ -1,6 +1,7 @@
 /target
 automation/node_modules/
 automation/.playwright-browsers/
+automation/login-failed.png
 .env
 automation/.env
 *.mp4

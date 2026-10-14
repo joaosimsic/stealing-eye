@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { envCredentials, launchBrowser, login } from "./shared";
+import { envCredentials, envLoginOptions, launchBrowser } from "./shared";
+import { runLoginMachine } from "./machines/login";
 
 function parseArgs(argv: string[]): { url: string | null } {
   let url: string | null = null;
@@ -16,14 +17,20 @@ async function main(): Promise<void> {
   const { url: argUrl } = parseArgs(process.argv);
   const url = argUrl || creds.url;
   if (!url) throw new Error("no URL given (pass as arg or set URL in .env)");
+  if (!creds.username || !creds.password) {
+    throw new Error("USERNAME and PASSWORD must be set in .env to log in");
+  }
 
   const browser = await launchBrowser();
   const context = await browser.newContext();
   const page = await context.newPage();
 
-  await page.goto(url, { waitUntil: "domcontentloaded" });
-  await login(page, creds);
-  console.log("logged in; browser stays open (Ctrl-C to quit)");
+  const finalState = await runLoginMachine({ page, creds, url, opts: envLoginOptions() });
+  if (finalState === "AUTHENTICATED") {
+    console.log("logged in; browser stays open (Ctrl-C to quit)");
+  } else {
+    console.error("login failed; browser stays open for inspection (Ctrl-C to quit)");
+  }
 
   const shutdown = () => {
     browser.close().finally(() => process.exit(0));

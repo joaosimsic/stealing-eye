@@ -1,6 +1,6 @@
 import * as net from "net";
 import * as path from "path";
-import { firefox, Browser, Locator, Page } from "playwright";
+import { firefox, Browser } from "playwright";
 
 // Keep the Playwright browser download inside this repo's node_modules.
 process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "0";
@@ -67,61 +67,16 @@ export async function launchBrowser(): Promise<Browser> {
   });
 }
 
-async function firstVisible(page: Page, selectors: string[]): Promise<Locator | null> {
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-    try {
-      if ((await locator.count()) > 0 && (await locator.isVisible())) return locator;
-    } catch {
-      // selector may be invalid on some pages; keep trying
-    }
-  }
-  return null;
+export interface LoginEnvOptions {
+  destinationUrl?: string;
+  successSelector?: string;
+  errorSelector?: string;
 }
 
-const USERNAME_SELECTORS = [
-  "input[type=email]",
-  "input[name*=user i]",
-  "input[name*=email i]",
-  "input[id*=user i]",
-  "input[id*=email i]",
-  "input[type=text]",
-];
-
-const PASSWORD_SELECTORS = ["input[type=password]"];
-
-const SUBMIT_SELECTORS = [
-  "button[type=submit]",
-  "input[type=submit]",
-  "form button",
-  "button",
-];
-
-export async function login(page: Page, creds: Credentials): Promise<void> {
-  if (!creds.username || !creds.password) {
-    throw new Error("USERNAME and PASSWORD must be set in .env to log in");
-  }
-
-  const username = await firstVisible(page, USERNAME_SELECTORS);
-  const password = await firstVisible(page, PASSWORD_SELECTORS);
-  if (!username || !password) {
-    throw new Error("could not find username/password fields on the page");
-  }
-
-  await username.fill(creds.username);
-  await password.fill(creds.password);
-
-  const submit = await firstVisible(page, SUBMIT_SELECTORS);
-  if (submit) {
-    await submit.click();
-  } else {
-    await password.press("Enter");
-  }
-
-  try {
-    await page.waitForLoadState("networkidle", { timeout: 15000 });
-  } catch {
-    // some apps never go idle; proceed anyway
-  }
-  console.log("login submitted");
+export function envLoginOptions(): LoginEnvOptions {
+  return {
+    destinationUrl: process.env.DESTINATION_URL || undefined,
+    successSelector: process.env.LOGIN_SUCCESS_SELECTOR || undefined,
+    errorSelector: process.env.LOGIN_ERROR_SELECTOR || undefined,
+  };
 }
