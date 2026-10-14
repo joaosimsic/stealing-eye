@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -8,9 +9,11 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::damage::{self, ConnectionExt as _, ReportLevel};
 use x11rb::protocol::Event;
 
+use crate::damage::collect_tree;
 use crate::x11::Rect;
 
 const POLL: Duration = Duration::from_millis(100);
+const RESCAN: Duration = Duration::from_millis(250);
 
 pub struct IdleWatcher {
     stop: Arc<AtomicBool>,
@@ -19,8 +22,8 @@ pub struct IdleWatcher {
 }
 
 impl IdleWatcher {
-    /// Watch `drawable` for changes. When `region` is set, only changes that
-    /// overlap that rectangle (in drawable coordinates) count.
+    /// Watch `drawable` and its descendants for changes. When `region` is set,
+    /// only changes that overlap that rectangle (in drawable coordinates) count.
     pub fn start(drawable: u32, region: Option<Rect>, timeout: Duration) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let fired = Arc::new(AtomicBool::new(false));
@@ -34,30 +37,45 @@ impl IdleWatcher {
         if !has_damage {
             anyhow::bail!("XDamage extension unavailable");
         }
-
-        let damage_id = conn.generate_id().context("idle watcher: generate_id")?;
         conn.damage_query_version(1, 1)
-            .context("idle watcher: damage_query_version")?
+            .context("idle watcher: query_version")?
             .reply()
-            .context("idle watcher: damage_query_version reply")?;
-        conn.damage_create(damage_id, drawable, ReportLevel::NON_EMPTY)
-            .context("idle watcher: damage_create")?
-            .check()
-            .context("idle watcher: damage_create rejected")?;
-        conn.flush().context("idle watcher: flush")?;
+            .context("idle watcher: query_version reply")?;
 
         let stop_thread = stop.clone();
         let fired_thread = fired.clone();
         let handle = thread::spawn(move || {
+            let mut selected: HashMap<u32, u32> = HashMap::new();
             let mut last = Instant::now();
+            let mut last_rescan = Instant::now() - RESCAN;
+
             while !stop_thread.load(Ordering::Relaxed) {
+                if last_rescan.elapsed() >= RESCAN {
+                    let targets = if region.is_some() {
+                        vec![drawable]
+                    } else {
+                        collect_tree(&conn, drawable)
+                    };
+                    for win in targets {
+                        if selected.contains_key(&win) {
+                            continue;
+                        }
+                        if let Ok(id) = conn.generate_id() {
+                            if let Ok(cookie) = conn.damage_create(id, win, ReportLevel::NON_EMPTY)
+                            {
+                                if cookie.check().is_ok() {
+                                    selected.insert(win, id);
+                                }
+                            }
+                        }
+                    }
+                    last_rescan = Instant::now();
+                }
+
                 loop {
                     match conn.poll_for_event() {
                         Ok(Some(Event::DamageNotify(ev))) => {
-                            if region
-                                .map(|r| overlaps(ev.area, r))
-                                .unwrap_or(true)
-                            {
+                            if region.map(|r| overlaps(ev.area, r)).unwrap_or(true) {
                                 last = Instant::now();
                             }
                         }
@@ -72,7 +90,10 @@ impl IdleWatcher {
                 }
                 thread::sleep(POLL);
             }
-            let _ = conn.damage_destroy(damage_id);
+
+            for id in selected.values() {
+                let _ = conn.damage_destroy(*id);
+            }
             let _ = conn.flush();
         });
 

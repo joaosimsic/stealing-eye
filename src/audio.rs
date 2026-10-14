@@ -3,8 +3,12 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use libpulse_binding::context::{Context as PulseContext, FlagSet as ContextFlagSet};
+use libpulse_binding::context::State as ContextState;
+use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
@@ -12,6 +16,40 @@ use libpulse_simple_binding::Simple;
 const RATE: u32 = 48_000;
 const CHANNELS: u8 = 2;
 const READ_CHUNK: usize = 8192; // multiple of the 2ch/16-bit frame size (4 bytes)
+
+/// Probe whether a PulseAudio/PipeWire server is reachable.
+pub fn available() -> bool {
+    let mut mainloop = match Mainloop::new() {
+        Some(m) => m,
+        None => return false,
+    };
+    let mut context = match PulseContext::new(&mainloop, "stealing-eye") {
+        Some(c) => c,
+        None => return false,
+    };
+    if context
+        .connect(None, ContextFlagSet::NOFLAGS, None)
+        .is_err()
+    {
+        return false;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match mainloop.iterate(true) {
+            IterateResult::Success(_) => {}
+            _ => return false,
+        }
+        match context.get_state() {
+            ContextState::Ready => return true,
+            ContextState::Failed | ContextState::Terminated => return false,
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
 
 pub struct AudioRecorder {
     stop: Arc<AtomicBool>,

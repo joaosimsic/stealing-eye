@@ -10,6 +10,20 @@ pub enum CaptureMode {
     Composite,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Grab each frame once it stops changing (stability), the most robust default.
+    Auto,
+    /// Same as auto: wait until two consecutive reads match before emitting.
+    Stable,
+    /// Wait for a completed Present before grabbing each window frame.
+    Present,
+    /// Wait for the window to stop repainting (XDamage quiescence) before grabbing.
+    Damage,
+    /// Fixed-interval capture (no synchronization).
+    Timer,
+}
+
 /// X11 screen recorder designed for non-interactive automation.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "stealing-eye", version, about)]
@@ -31,19 +45,15 @@ pub struct Cli {
     pub fps: u32,
 
     /// Output file path.
-    #[arg(long, env = "SE_OUTPUT", default_value = "recording.mp4")]
+    #[arg(short = 'o', long, env = "SE_OUTPUT", default_value = "recording.mp4")]
     pub output: String,
 
     /// Stop automatically after this many seconds.
-    #[arg(long, value_name = "SECS")]
+    #[arg(short = 'd', long, value_name = "SECS")]
     pub duration: Option<f64>,
 
-    /// Record system audio (monitor of the default sink).
-    #[arg(long)]
-    pub audio: bool,
-
-    /// Force-disable audio even if other flags request it.
-    #[arg(long = "no-audio", conflicts_with = "audio")]
+    /// Disable audio (system audio is recorded by default).
+    #[arg(long = "no-audio")]
     pub no_audio: bool,
 
     /// PulseAudio source to record instead of the default sink monitor.
@@ -90,11 +100,20 @@ pub struct Cli {
     /// Capture backend.
     #[arg(long, value_enum, default_value_t = CaptureMode::Auto)]
     pub capture: CaptureMode,
+
+    /// Frame synchronization.
+    #[arg(long, value_enum, default_value_t = SyncMode::Auto)]
+    pub sync: SyncMode,
+
+    /// Max time (ms) to wait for a frame to settle in stable sync. Defaults to
+    /// min(frame interval / 2, 15).
+    #[arg(long, value_name = "MS")]
+    pub sync_budget_ms: Option<u64>,
 }
 
 impl Cli {
     pub fn audio_enabled(&self) -> bool {
-        self.audio && !self.no_audio
+        !self.no_audio
     }
 
     pub fn control_enabled(&self) -> bool {

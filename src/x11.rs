@@ -27,6 +27,7 @@ pub struct X11 {
     pub root_height: u16,
     pub bits_per_pixel: u8,
     pub shm_available: bool,
+    pub screen_num: usize,
 }
 
 impl X11 {
@@ -66,7 +67,23 @@ impl X11 {
             root_height,
             bits_per_pixel,
             shm_available,
+            screen_num,
         })
+    }
+
+    /// True if an EWMH compositor owns `_NET_WM_CM_S<n>`.
+    pub fn compositor_present(&self) -> bool {
+        let name = format!("_NET_WM_CM_S{}", self.screen_num);
+        match self.intern(&name) {
+            Ok(atom) => self
+                .conn
+                .get_selection_owner(atom)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.owner != x11rb::NONE)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     /// Resolve a capture target to a root-relative rect plus what to capture.

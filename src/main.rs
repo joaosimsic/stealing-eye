@@ -2,9 +2,11 @@ mod audio;
 mod capture;
 mod cli;
 mod control;
+mod damage;
 mod encoder;
 mod idle;
 mod output;
+mod present;
 mod x11;
 
 use std::path::{Path, PathBuf};
@@ -18,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
 
-use cli::{CaptureMode, Cli};
+use cli::{CaptureMode, Cli, SyncMode};
 use control::{Command as Ctrl, Hub};
 use output::{exit, Reporter};
 
@@ -262,11 +264,54 @@ fn run_session(
         None => None,
     };
 
+    let quiesce = Duration::from_millis(8);
     let frame_dur = Duration::from_secs_f64(1.0 / cli.fps as f64);
+    let stable = matches!(cli.sync, SyncMode::Auto | SyncMode::Stable);
+    let budget = cli
+        .sync_budget_ms
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| (frame_dur / 2).min(Duration::from_millis(15)));
+
+    let mut present_watch = if cli.sync == SyncMode::Present {
+        match target {
+            x11::Target::Window(win) if present::present_available(&x.conn) => {
+                match present::PresentWatcher::start(win) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        rep.log(&format!("present sync unavailable: {e:#}"));
+                        None
+                    }
+                }
+            }
+            x11::Target::Window(_) => {
+                rep.log("Present extension unavailable");
+                None
+            }
+            x11::Target::Root => None,
+        }
+    } else {
+        None
+    };
+
+    let mut damage_watch = if cli.sync == SyncMode::Damage {
+        match target {
+            x11::Target::Window(win) => start_damage(win, quiesce, rep),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let deadline = max_clip.map(|d| Instant::now() + d);
     let start = Instant::now();
     let mut count: u64 = 0;
     let mut session_stop = false;
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut have_frame = false;
+    let mut last_seq = signal_seq(&present_watch, &damage_watch);
+    let mut next_emit = start;
+    let mut unsettled: u64 = 0;
 
     loop {
         if stop_all.load(Ordering::SeqCst) {
@@ -295,20 +340,80 @@ fn run_session(
             }
         }
 
-        match capturer.frame() {
-            Ok(frame) => enc.write_frame(frame)?,
-            Err(e) => {
-                rep.log(&format!("capture stopped: {e:#}"));
-                break;
-            }
-        }
-        count += 1;
-
-        let next = start + frame_dur * (count as u32);
         let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
+        let mut did_work = false;
+
+        // Present/damage modes: capture as soon as a new frame is signalled.
+        let current = signal_seq(&present_watch, &damage_watch);
+        if current != last_seq {
+            match capturer.frame() {
+                Ok(frame) => {
+                    buffer.clear();
+                    buffer.extend_from_slice(frame);
+                    have_frame = true;
+                }
+                Err(e) => {
+                    rep.log(&format!("capture stopped: {e:#}"));
+                    break;
+                }
+            }
+            last_seq = current;
+            did_work = true;
         }
+
+        // Emit at the fixed frame rate.
+        if now >= next_emit {
+            if stable {
+                match stabilize(&capturer, &mut buffer, &mut have_frame, budget, stop_all) {
+                    Ok(true) => {}
+                    Ok(false) => unsettled += 1,
+                    Err(e) => {
+                        rep.log(&format!("capture stopped: {e:#}"));
+                        break;
+                    }
+                }
+            } else if !have_frame {
+                match capturer.frame() {
+                    Ok(frame) => {
+                        buffer.clear();
+                        buffer.extend_from_slice(frame);
+                        have_frame = true;
+                    }
+                    Err(e) => {
+                        rep.log(&format!("capture stopped: {e:#}"));
+                        break;
+                    }
+                }
+            }
+            enc.write_frame(&buffer)?;
+            count += 1;
+            next_emit = start + frame_dur * (count as u32);
+            did_work = true;
+        }
+
+        if !did_work {
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    if stable {
+        if unsettled > 0 {
+            rep.log(&format!(
+                "stable sync: {unsettled} frame(s) did not settle within {budget:?}"
+            ));
+        }
+    } else if cli.sync != SyncMode::Timer {
+        rep.log(&format!(
+            "sync: {} presents, {} damage settles",
+            present_watch.as_ref().map(|p| p.seq()).unwrap_or(0),
+            damage_watch.as_ref().map(|d| d.settled()).unwrap_or(0),
+        ));
+    }
+    if let Some(mut p) = present_watch.take() {
+        p.stop();
+    }
+    if let Some(mut d) = damage_watch.take() {
+        d.stop();
     }
 
     if let Some(mut i) = idle.take() {
@@ -360,41 +465,112 @@ fn build_capturer<'a>(
     root_rect: x11::Rect,
     rep: &Reporter,
 ) -> Result<(capture::ShmCapturer<'a>, String), SessionFail> {
-    let composite_ok = capture::composite_available(&x.conn);
-    let want_composite = match cli.capture {
-        CaptureMode::Root => false,
-        CaptureMode::Composite => true,
-        CaptureMode::Auto => composite_ok,
-    };
+    if cli.capture == CaptureMode::Root {
+        rep.log("capture backend: root buffer");
+        let capturer = capture::ShmCapturer::root(&x.conn, x.root, root_rect, x.bits_per_pixel)?;
+        return Ok((capturer, "bgr0".to_string()));
+    }
 
-    if want_composite && composite_ok {
-        let attempt = match target {
-            x11::Target::Window(win) => {
-                capture::ShmCapturer::composite_window(&x.conn, win, x.bits_per_pixel)
-                    .map(|(c, depth)| (c, pix_fmt_for_depth(depth)))
+    let composite_ok = capture::composite_available(&x.conn);
+    if !composite_ok {
+        if cli.capture == CaptureMode::Composite {
+            return Err(anyhow!("XComposite extension unavailable on this X server").into());
+        }
+        let capturer = capture::ShmCapturer::root(&x.conn, x.root, root_rect, x.bits_per_pixel)?;
+        return Ok((capturer, "bgr0".to_string()));
+    }
+
+    let compositor = x.compositor_present();
+
+    // With a compositor running, the composited root is an atomically presented
+    // frame: crop it (window or region) instead of redirecting windows ourselves.
+    if compositor || matches!(target, x11::Target::Root) {
+        match capture::ShmCapturer::composite_root(&x.conn, x.root, root_rect, x.bits_per_pixel) {
+            Ok((c, depth)) => {
+                rep.log(if compositor { "capture backend: composited root" } else { "capture backend: composited root (no compositor)" });
+                return Ok((c, pix_fmt_for_depth(depth)));
             }
-            x11::Target::Root => {
-                capture::ShmCapturer::composite_root(&x.conn, x.root, root_rect, x.bits_per_pixel)
-                    .map(|(c, depth)| (c, pix_fmt_for_depth(depth)))
+            Err(e) => {
+                if cli.capture == CaptureMode::Composite {
+                    return Err(e.into());
+                }
+                if compositor {
+                    rep.log(&format!("root composite unavailable ({e:#}); trying window"));
+                }
             }
-        };
-        match attempt {
-            Ok(v) => return Ok(v),
+        }
+    }
+
+    // No compositor: redirect the target window and read its own pixmap.
+    if let x11::Target::Window(win) = target {
+        match capture::ShmCapturer::composite_window(&x.conn, win, x.bits_per_pixel) {
+            Ok((c, depth)) => {
+                rep.log("capture backend: window composite");
+                return Ok((c, pix_fmt_for_depth(depth)));
+            }
             Err(e) => {
                 if cli.capture == CaptureMode::Composite {
                     return Err(e.into());
                 }
                 rep.log(&format!(
-                    "composite capture unavailable ({e:#}); falling back to root"
+                    "window composite unavailable ({e:#}); falling back to root buffer"
                 ));
             }
         }
-    } else if cli.capture == CaptureMode::Composite {
-        return Err(anyhow!("XComposite extension unavailable on this X server").into());
     }
 
+    rep.log("capture backend: root buffer");
     let capturer = capture::ShmCapturer::root(&x.conn, x.root, root_rect, x.bits_per_pixel)?;
     Ok((capturer, "bgr0".to_string()))
+}
+
+fn stabilize(
+    capturer: &capture::ShmCapturer,
+    buffer: &mut Vec<u8>,
+    have_frame: &mut bool,
+    budget: Duration,
+    stop_all: &AtomicBool,
+) -> Result<bool> {
+    let start = Instant::now();
+    loop {
+        let frame = capturer.frame()?;
+        if *have_frame && frame == buffer.as_slice() {
+            return Ok(true);
+        }
+        buffer.clear();
+        buffer.extend_from_slice(frame);
+        *have_frame = true;
+        if stop_all.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        if start.elapsed() >= budget {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn signal_seq(
+    present: &Option<present::PresentWatcher>,
+    damage: &Option<damage::DamageWatcher>,
+) -> u64 {
+    if let Some(p) = present {
+        p.seq()
+    } else if let Some(d) = damage {
+        d.settled()
+    } else {
+        0
+    }
+}
+
+fn start_damage(win: u32, quiesce: Duration, rep: &Reporter) -> Option<damage::DamageWatcher> {
+    match damage::DamageWatcher::start(win, quiesce) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            rep.log(&format!("damage sync unavailable: {e:#}"));
+            None
+        }
+    }
 }
 
 fn pix_fmt_for_depth(depth: u8) -> String {
@@ -466,6 +642,11 @@ fn validate(cli: &Cli, rep: &Reporter) -> Result<(), i32> {
     if !encoder::ffmpeg_available(&cli.ffmpeg) {
         rep.log(&format!("ffmpeg not found at '{}'", cli.ffmpeg));
         return Err(exit::FFMPEG);
+    }
+
+    if cli.audio_enabled() && !audio::available() {
+        rep.log("no PulseAudio/PipeWire server available (use --no-audio to disable audio)");
+        return Err(exit::AUDIO);
     }
 
     Ok(())
