@@ -35,7 +35,12 @@ async function runStep(ctx: LoginContext, step: Step): Promise<void> {
   if (step.action) {
     await step.action(ctx);
   } else if (step.input && field) {
-    const value = step.input === "email" ? ctx.creds.email : ctx.creds.password;
+    const value =
+      step.input === "email"
+        ? ctx.creds.email
+        : step.input === "password"
+          ? ctx.creds.password
+          : ctx.opts.show;
     await typeHuman(field, value ?? "");
   } else if (step.input) {
     throw new Error(`step ${step.name}: input steps need string/array selectors as ready`);
@@ -58,11 +63,11 @@ async function runStep(ctx: LoginContext, step: Step): Promise<void> {
   ctx.emit?.("step", { phase: "done", step: step.name });
 }
 
-function stepStates(steps: Step[]): Record<StateName, StateDef<LoginContext>> {
+function stepStates(steps: Step[], doneState: StateName = "CHECK_RESULT"): Record<StateName, StateDef<LoginContext>> {
   const states: Record<StateName, StateDef<LoginContext>> = {};
   steps.forEach((step, index) => {
     const state = `STEP_${step.name}`;
-    const next = step.next ?? (index + 1 < steps.length ? `STEP_${steps[index + 1].name}` : "CHECK_RESULT");
+    const next = step.next ?? (index + 1 < steps.length ? `STEP_${steps[index + 1].name}` : doneState);
     states[state] = {
       action: (ctx) => runStep(ctx, step),
       exit: async (ctx) => ctx.done?.has(step.name) ?? false,
@@ -72,12 +77,12 @@ function stepStates(steps: Step[]): Record<StateName, StateDef<LoginContext>> {
   return states;
 }
 
-function openLoginState(loginUrl: string, firstStep: StateName): StateDef<LoginContext> {
+function openState(url: string, firstStep: StateName): StateDef<LoginContext> {
   return {
     action: async (ctx) => {
-      if (ctx.page.url() !== loginUrl) {
+      if (ctx.page.url() !== url) {
         await pauseAction();
-        await ctx.page.goto(loginUrl, { waitUntil: "domcontentloaded" });
+        await ctx.page.goto(url, { waitUntil: "domcontentloaded" });
       }
       ctx.loginUrl = ctx.page.url();
     },
@@ -131,12 +136,58 @@ export function buildLoginMachine(adapter: SiteAdapter): BuiltMachine {
   const firstStep = steps.length ? `STEP_${steps[0].name}` : "LOGIN_PAGE";
 
   const states: Record<StateName, StateDef<LoginContext>> = {
-    ...(steps.length ? { GOTO_LOGIN: openLoginState(adapter.loginUrl, firstStep) } : {}),
+    ...(steps.length ? { GOTO_LOGIN: openState(adapter.loginUrl, firstStep) } : {}),
     ...stepStates(steps),
     ...sharedStates(adapter),
     ...(adapter.states ?? {}),
   };
 
   const initial = adapter.initial ?? (steps.length ? "GOTO_LOGIN" : "LOGIN_PAGE");
+  return { initial, states };
+}
+
+export function buildSearchMachine(adapter: SiteAdapter): BuiltMachine {
+  const spec = adapter.search;
+  if (!spec) throw new Error(`adapter ${adapter.id} has no search config`);
+
+  const steps: Step[] = [{ name: "QUERY", ready: spec.input, input: "show", submit: spec.submit }];
+  const firstStep = "STEP_QUERY";
+
+  const states: Record<StateName, StateDef<LoginContext>> = {
+    ...(spec.url ? { GOTO_SEARCH: openState(spec.url, firstStep) } : {}),
+    ...stepStates(steps, "CHECK_SEARCH"),
+
+    CHECK_SEARCH: {
+      exit: async (ctx) => conditionMet(ctx, spec.expect),
+      next: "SEARCH_FOUND",
+      timeoutMs: spec.timeoutMs ?? CHECK_TIMEOUT_MS,
+    },
+
+    SEARCH_FOUND: {
+      action: async (ctx) => {
+        console.log(`[search] found "${ctx.opts.show}" at ${ctx.page.url()}`);
+      },
+      exit: async () => true,
+      next: "SEARCH_FOUND",
+      terminal: true,
+    },
+
+    SEARCH_NOT_FOUND: {
+      action: async (ctx) => {
+        const shot = path.join(__dirname, "..", "..", "..", "search-failed.png");
+        try {
+          await ctx.page.screenshot({ path: shot });
+        } catch {
+          // page may be gone; failure is reported regardless
+        }
+        console.error(`[search] "${ctx.opts.show}" not found at ${ctx.page.url()} (screenshot: ${shot})`);
+      },
+      exit: async () => true,
+      next: "SEARCH_NOT_FOUND",
+      terminal: true,
+    },
+  };
+
+  const initial = spec.url ? "GOTO_SEARCH" : firstStep;
   return { initial, states };
 }

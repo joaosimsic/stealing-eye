@@ -67,10 +67,25 @@ export async function launchBrowser(): Promise<Browser> {
 
 export interface LoginEnvOptions {
   site?: string;
+  show?: string;
 }
 
 export function envLoginOptions(): LoginEnvOptions {
   return {
     site: process.env.SITE || undefined,
+    show: process.env.SHOW || undefined,
   };
+}
+
+/** Validates the required environment before any automation runs. */
+export function validateEnv(): { site: string; show: string } {
+  const missing: string[] = [];
+  if (!process.env.SITE) missing.push("SITE");
+  if (!process.env.EMAIL) missing.push("EMAIL");
+  if (!process.env.PASSWORD) missing.push("PASSWORD");
+  if (!process.env.SHOW) missing.push("SHOW");
+  if (missing.length) {
+    throw new Error(`missing required env: ${missing.join(", ")}`);
+  }
+  return { site: process.env.SITE!, show: process.env.SHOW! };
 }

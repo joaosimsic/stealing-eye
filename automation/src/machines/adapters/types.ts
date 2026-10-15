@@ -5,6 +5,8 @@ import { Credentials } from "../../shared";
 export interface LoginOptions {
   /** Force a specific adapter id instead of hostname matching. */
   site?: string;
+  /** Show to search for after authentication. */
+  show?: string;
   timeoutMs?: number;
   pollMs?: number;
 }
@@ -46,7 +48,7 @@ export interface Step {
   name: string;
   ready: ReadyCheck;
   /** Fill email/password credential into the first visible ready selector. */
-  input?: "email" | "password";
+  input?: "email" | "password" | "show";
   /** Extra action; when set, it replaces the input fill. */
   action?: (ctx: LoginContext) => Promise<void>;
   /** Clicked after the input/action; Enter pressed on the input as fallback. */
@@ -57,12 +59,26 @@ export interface Step {
   next?: StateName | ((ctx: LoginContext) => StateName);
 }
 
+export interface SearchSpec {
+  /** Optional page to open before searching; defaults to the current page. */
+  url?: string;
+  /** Search input selectors (any-of). */
+  input: string | string[];
+  /** Submit control; Enter pressed on the input when omitted. */
+  submit?: string | string[];
+  /** Condition that marks results as loaded. */
+  expect: Condition;
+  timeoutMs?: number;
+}
+
 export interface SiteAdapter {
   id: string;
   /** Entry point for login; the machine always navigates here first. */
   loginUrl: string;
   /** Navigated to after authentication succeeds. */
   destinationUrl?: string;
+  /** Show search config, run after authentication. */
+  search?: SearchSpec;
   /** Start state; defaults to first step (or LOGIN_PAGE for state-only adapters). */
   initial?: StateName;
   steps?: Step[];

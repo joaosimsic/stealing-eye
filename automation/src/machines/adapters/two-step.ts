@@ -1,10 +1,12 @@
 import { StateDef, StateName } from "../../machine";
-import { Condition, LoginContext, ReadyCheck, SiteAdapter, Step } from "./types";
+import { Condition, LoginContext, ReadyCheck, SearchSpec, SiteAdapter, Step } from "./types";
 
 export interface TwoStepOptions {
   id: string;
   loginUrl: string;
   destinationUrl: string;
+  /** Show search config, run after authentication. */
+  search?: SearchSpec;
   /** Optional consent banner dismissed before the email step. */
   consent?: {
     ready: ReadyCheck;
@@ -62,6 +64,7 @@ export function twoStepLogin(opts: TwoStepOptions): SiteAdapter {
     id: opts.id,
     loginUrl: opts.loginUrl,
     destinationUrl: opts.destinationUrl,
+    search: opts.search,
     steps,
     success: opts.success,
     error: opts.error,

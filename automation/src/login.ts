@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { envCredentials, envLoginOptions, launchBrowser } from "./shared";
-import { runLoginMachine } from "./machines/login";
+import { envCredentials, envLoginOptions, launchBrowser, validateEnv } from "./shared";
+import { runAutomation } from "./run";
 import { listAdapters } from "./sites";
 
 interface Args {
@@ -29,10 +29,8 @@ async function main(): Promise<void> {
     return;
   }
 
+  validateEnv();
   const creds = envCredentials();
-  if (!creds.email || !creds.password) {
-    throw new Error("EMAIL and PASSWORD must be set in .env to log in");
-  }
 
   const browser = await launchBrowser();
   const context = await browser.newContext();
@@ -42,15 +40,19 @@ async function main(): Promise<void> {
   const emit = (name: string, data?: Record<string, unknown>): void => {
     console.log(`[event] ${name} ${data ? JSON.stringify(data) : ""}`.trim());
   };
-  const finalState = await runLoginMachine({ page, creds, opts, emit });
-  if (finalState === "AUTHENTICATED") {
-    console.log("logged in; browser stays open (Ctrl-C to quit)");
-  } else {
-    console.error("login failed; browser stays open for inspection (Ctrl-C to quit)");
+
+  let exitCode = 0;
+  try {
+    await runAutomation({ page, creds, opts, emit });
+    console.log("authenticated and searched; browser stays open (Ctrl-C to quit)");
+  } catch (e) {
+    exitCode = 1;
+    console.error((e as Error).message);
+    console.error("automation failed; browser stays open for inspection (Ctrl-C to quit)");
   }
 
   const shutdown = () => {
-    browser.close().finally(() => process.exit(0));
+    browser.close().finally(() => process.exit(exitCode));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "child_process";
-import { Control, Credentials, envCredentials, envLoginOptions, launchBrowser } from "./shared";
-import { runLoginMachine } from "./machines/login";
+import { Control, Credentials, envCredentials, envLoginOptions, launchBrowser, validateEnv } from "./shared";
+import { runAutomation } from "./run";
 import { readRecorderConfig, startRecorder } from "./recorder";
 
 interface Opts {
@@ -135,10 +135,8 @@ function findFirefoxWindow(titleHint?: string): string {
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
+  validateEnv();
   const creds: Credentials = envCredentials();
-  if (!creds.email || !creds.password) {
-    throw new Error("EMAIL and PASSWORD must be set in .env to log in");
-  }
 
   const rec = readRecorderConfig();
   const recorder = await startRecorder({
@@ -219,9 +217,12 @@ async function main(): Promise<void> {
   const emit = (name: string, data?: Record<string, unknown>): void => {
     control.send({ cmd: "event", name, data });
   };
-  const finalState = await runLoginMachine({ page, creds, opts: loginOpts, emit });
-  if (finalState !== "AUTHENTICATED") {
-    console.warn(`login ended in ${finalState}; watching anyway (Ctrl-C to quit)`);
+  try {
+    await runAutomation({ page, creds, opts: loginOpts, emit });
+  } catch (e) {
+    console.error((e as Error).message);
+    shutdown(1);
+    return;
   }
 
   page.on("close", () => {

@@ -4,6 +4,11 @@ export const hboMax = twoStepLogin({
   id: "hbo-max",
   loginUrl: "https://auth.hbomax.com/login",
   destinationUrl: "https://play.hbomax.com/",
+  search: {
+    input: ['input[type="search"]'],
+    submit: ['button[type="submit"]'],
+    expect: { selector: '[data-testid="search-results"]' },
+  },
   consent: {
     ready: '[data-testid="consent-modal-button-0"]',
     submit: '[data-testid="consent-modal-button-0"]',
