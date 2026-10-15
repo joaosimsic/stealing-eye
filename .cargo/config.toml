@@ -1,13 +1,4 @@
 [target.x86_64-unknown-linux-gnu]
-# Use the repo-local linker shim so plain `cargo build/run` works even when a
-# nix dev shell injects a nix glibc rpath into every link. On a clean system you
-# can replace this with "cc".
-linker = "scripts/cc"
-
-# Neutralize nix-injected runtime paths so build scripts and the `cargo run`
-# binary resolve system libraries. See scripts/cc.
-[env]
-LD_LIBRARY_PATH = { value = "", force = true }
-NIX_LD_LIBRARY_PATH = { value = "", force = true }
-LIBRARY_PATH = { value = "", force = true }
-PKG_CONFIG_PATH = { value = "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig", force = true }
+# Use the nix toolchain's cc wrapper. Runtime library paths (glibc, libpulse,
+# ffmpeg) come from the rpath set in ~/.cargo/config.toml.
+linker = "cc"
