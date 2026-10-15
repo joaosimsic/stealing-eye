@@ -1,7 +1,6 @@
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -134,20 +133,49 @@ impl AudioRecorder {
 }
 
 fn default_monitor() -> Result<String> {
-    let out = Command::new("pactl")
-        .arg("get-default-sink")
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .context("running `pactl get-default-sink`")?;
-    if !out.status.success() {
-        bail!(
-            "pactl get-default-sink failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    let mut mainloop = Mainloop::new().context("creating pulse mainloop")?;
+    let mut context = PulseContext::new(&mainloop, "stealing-eye")
+        .context("creating pulse context")?;
+    context
+        .connect(None, ContextFlagSet::NOFLAGS, None)
+        .context("connecting to pulse server")?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match mainloop.iterate(true) {
+            IterateResult::Success(_) => {}
+            _ => bail!("pulse mainloop failed"),
+        }
+        match context.get_state() {
+            ContextState::Ready => break,
+            ContextState::Failed | ContextState::Terminated => bail!("pulse connection failed"),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out connecting to pulse server");
+        }
     }
-    let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if sink.is_empty() {
-        bail!("no default pulse sink; pass --audio-device");
+
+    let sink: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let sink_cb = Arc::clone(&sink);
+    let introspect = context.introspect();
+    let _op = introspect.get_server_info(move |info| {
+        if let Some(name) = &info.default_sink_name {
+            *sink_cb.lock().unwrap() = Some(name.to_string());
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(name) = sink.lock().unwrap().clone() {
+            return Ok(format!("{name}.monitor"));
+        }
+        match mainloop.iterate(true) {
+            IterateResult::Success(_) => {}
+            _ => bail!("pulse mainloop failed"),
+        }
+        if Instant::now() >= deadline {
+            bail!("no default pulse sink; pass --audio-device");
+        }
     }
-    Ok(format!("{sink}.monitor"))
 }
