@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 import { execFileSync } from "child_process";
-import { Page } from "playwright";
 import { Control, Credentials, envCredentials, envLoginOptions, launchBrowser } from "./shared";
 import { runLoginMachine } from "./machines/login";
+import { readRecorderConfig, startRecorder } from "./recorder";
 
 interface Opts {
-  socket: string;
-  url: string | null;
   site?: string;
+  output: string;
+  fps: number;
+  minClip: number;
   minDuration: number;
   minAreaRatio: number;
   stopDebounceMs: number;
+  audio: boolean;
 }
 
 interface Signal {
@@ -21,25 +23,60 @@ interface Signal {
   src?: string;
 }
 
+const REQUIRED_FLAGS = [
+  "--output",
+  "--fps",
+  "--min-clip",
+  "--min-duration",
+  "--min-area",
+  "--stop-debounce",
+] as const;
+
 function parseArgs(argv: string[]): Opts {
-  const opts: Opts = {
-    socket: process.env.SE_CONTROL || "/tmp/stealing-eye.sock",
-    url: null,
-    minDuration: 20,
-    minAreaRatio: 0.4,
-    stopDebounceMs: 1000,
-  };
+  const seen = new Set<string>();
+  let site: string | undefined;
+  let output: string | undefined;
+  let fps: number | undefined;
+  let minClip: number | undefined;
+  let minDuration: number | undefined;
+  let minAreaRatio: number | undefined;
+  let stopDebounceMs: number | undefined;
+  let audio: boolean | undefined;
+
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--socket") opts.socket = argv[++i];
-    else if (a === "--site") opts.site = argv[++i];
-    else if (a === "--min-duration") opts.minDuration = Number(argv[++i]);
-    else if (a === "--min-area") opts.minAreaRatio = Number(argv[++i]);
-    else if (a === "--stop-debounce") opts.stopDebounceMs = Number(argv[++i]);
-    else if (a.startsWith("-")) throw new Error(`unknown flag ${a}`);
-    else opts.url = a;
+    const num = (): number => {
+      const v = Number(argv[++i]);
+      if (!Number.isFinite(v)) throw new Error(`flag ${a} requires a number`);
+      return v;
+    };
+    if (a === "--site") site = argv[++i];
+    else if (a === "--output") output = argv[++i];
+    else if (a === "--fps") fps = num();
+    else if (a === "--min-clip") minClip = num();
+    else if (a === "--min-duration") minDuration = num();
+    else if (a === "--min-area") minAreaRatio = num();
+    else if (a === "--stop-debounce") stopDebounceMs = num();
+    else if (a === "--audio") audio = true;
+    else if (a === "--no-audio") audio = false;
+    else throw new Error(`unknown flag ${a}`);
+    if (a.startsWith("--") && a !== "--site") seen.add(a);
   }
-  return opts;
+
+  const missing = REQUIRED_FLAGS.filter((f) => !seen.has(f));
+  if (missing.length) throw new Error(`missing required flags: ${missing.join(", ")}`);
+  if (audio === undefined) throw new Error("missing required flag: --audio or --no-audio");
+
+  return {
+    site,
+    output: output!,
+    fps: fps!,
+    minClip: minClip!,
+    minDuration: minDuration!,
+    minAreaRatio: minAreaRatio!,
+    stopDebounceMs: stopDebounceMs!,
+    audio,
+  };
 }
 
 const INIT_SCRIPT = (minDuration: number, minArea: number): string => `
@@ -71,12 +108,12 @@ const INIT_SCRIPT = (minDuration: number, minArea: number): string => `
 })();
 `;
 
-function findFirefoxWindow(titleHint?: string): string | null {
+function findFirefoxWindow(titleHint?: string): string {
   let out: string;
   try {
     out = execFileSync("wmctrl", ["-l"], { encoding: "utf8" });
-  } catch {
-    return null;
+  } catch (e) {
+    throw new Error(`wmctrl failed: ${(e as Error).message}`);
   }
   const rows = out
     .split("\n")
@@ -87,43 +124,56 @@ function findFirefoxWindow(titleHint?: string): string | null {
     })
     .filter((r): r is { id: string; title: string } => r !== null);
   const hint = (titleHint || "").toLowerCase();
-  const byHint = rows.find((r) => hint && r.title.toLowerCase().includes(hint));
-  if (byHint) return byHint.id;
-  const firefox = rows.find((r) => /firefox/i.test(r.title));
-  return firefox ? firefox.id : null;
+  const match = hint
+    ? rows.find((r) => r.title.toLowerCase().includes(hint))
+    : rows.find((r) => /firefox/i.test(r.title));
+  if (!match) {
+    throw new Error(`no Firefox window matched '${titleHint ?? ""}'`);
+  }
+  return match.id;
 }
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv);
   const creds: Credentials = envCredentials();
-  const hasCreds = Boolean(creds.username && creds.password);
-  const control = new Control(opts.socket);
-
-  let connected = true;
-  try {
-    await control.connect();
-    console.log(`connected to ${opts.socket}`);
-  } catch (e) {
-    if (!hasCreds) {
-      console.error(`cannot connect to stealing-eye socket ${opts.socket}: ${(e as Error).message}`);
-      process.exit(1);
-    }
-    connected = false;
-    console.warn(
-      `cannot connect to stealing-eye socket ${opts.socket} (${(e as Error).message}); continuing in login-only mode`
-    );
+  if (!creds.email || !creds.password) {
+    throw new Error("EMAIL and PASSWORD must be set in .env to log in");
   }
+
+  const rec = readRecorderConfig();
+  const recorder = await startRecorder({
+    bin: rec.bin,
+    socket: rec.socket,
+    args: ["-o", opts.output, "--fps", String(opts.fps), "--min-clip", String(opts.minClip), ...(opts.audio ? [] : ["--no-audio"])],
+    connectTimeoutMs: 10000,
+  });
+
+  const control = new Control(rec.socket);
+  await control.connect();
+  console.log(`connected to ${rec.socket}`);
 
   const browser = await launchBrowser();
   const context = await browser.newContext();
-  await context.exposeBinding("__seSignal", (_source, payload: Signal) => {
-    handleSignal(payload);
-  });
   await context.addInitScript(INIT_SCRIPT(opts.minDuration, opts.minAreaRatio));
 
   const playing = new Set<number>();
   let recording = false;
   let stopTimer: NodeJS.Timeout | null = null;
+  let shuttingDown = false;
+
+  const shutdown = (code: number): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      if (recording) control.send({ cmd: "stop" });
+    } catch {
+      // control socket may be gone
+    }
+    recorder
+      .stop()
+      .catch((e: Error) => console.error(`stopping recorder: ${e.message}`))
+      .finally(() => browser.close().finally(() => process.exit(code)));
+  };
 
   function handleSignal(payload: Signal): void {
     if (!payload || !payload.type) return;
@@ -137,12 +187,8 @@ async function main(): Promise<void> {
       if (!recording) {
         const win = findFirefoxWindow(payload.title);
         recording = true;
-        control.send({
-          cmd: "start",
-          window: win || undefined,
-          label: payload.title || undefined,
-        });
-        console.log(`start clip (window=${win || "whole screen"})`);
+        control.send({ cmd: "start", window: win, label: payload.title || undefined });
+        console.log(`start clip (window=${win})`);
       }
     } else if (payload.type === "pause" || payload.type === "ended") {
       playing.delete(id);
@@ -159,18 +205,23 @@ async function main(): Promise<void> {
     }
   }
 
-  const url = opts.url || creds.url;
-  const page = await context.newPage();
-  if (url) {
-    if (hasCreds) {
-      const loginOpts = { ...envLoginOptions(), ...(opts.site ? { site: opts.site } : {}) };
-      const finalState = await runLoginMachine({ page, creds, url, opts: loginOpts });
-      if (finalState !== "AUTHENTICATED") {
-        console.warn(`login ended in ${finalState}; watching anyway (Ctrl-C to quit)`);
-      }
-    } else {
-      await page.goto(url, { waitUntil: "domcontentloaded" });
+  await context.exposeBinding("__seSignal", (_source, payload: Signal) => {
+    try {
+      handleSignal(payload);
+    } catch (e) {
+      console.error((e as Error).message);
+      shutdown(1);
     }
+  });
+
+  const page = await context.newPage();
+  const loginOpts = { ...envLoginOptions(), ...(opts.site ? { site: opts.site } : {}) };
+  const emit = (name: string, data?: Record<string, unknown>): void => {
+    control.send({ cmd: "event", name, data });
+  };
+  const finalState = await runLoginMachine({ page, creds, opts: loginOpts, emit });
+  if (finalState !== "AUTHENTICATED") {
+    console.warn(`login ended in ${finalState}; watching anyway (Ctrl-C to quit)`);
   }
 
   page.on("close", () => {
@@ -179,16 +230,10 @@ async function main(): Promise<void> {
       control.send({ cmd: "stop" });
     }
   });
+  browser.on("disconnected", () => shutdown(0));
 
-  const shutdown = () => {
-    try {
-      if (recording) control.send({ cmd: "stop" });
-      if (connected) control.send({ cmd: "shutdown" });
-    } catch {}
-    browser.close().finally(() => process.exit(0));
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => shutdown(0));
+  process.on("SIGTERM", () => shutdown(0));
 
   console.log("watching for <video> playback (Ctrl-C to quit)");
 }

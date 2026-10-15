@@ -8,15 +8,13 @@ process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 export interface Credentials {
-  url?: string;
-  username?: string;
+  email?: string;
   password?: string;
 }
 
 export function envCredentials(): Credentials {
   return {
-    url: process.env.URL,
-    username: process.env.USERNAME,
+    email: process.env.EMAIL,
     password: process.env.PASSWORD,
   };
 }

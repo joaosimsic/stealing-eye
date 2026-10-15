@@ -1,69 +1,70 @@
 import { StateDef, StateName } from "../../machine";
-import { Condition, LoginContext, SiteAdapter } from "./types";
-import { visible } from "./selectors";
+import { Condition, LoginContext, ReadyCheck, SiteAdapter, Step } from "./types";
 
 export interface TwoStepOptions {
-  id?: string;
-  hosts?: RegExp | string[];
-  destinationUrl?: string;
+  id: string;
+  loginUrl: string;
+  destinationUrl: string;
+  /** Optional consent banner dismissed before the email step. */
+  consent?: {
+    ready: ReadyCheck;
+    submit: string | string[];
+    timeoutMs?: number;
+    /** When true, a missing banner is skipped instead of failing. */
+    optional?: boolean;
+  };
   /** Email/username field selectors (any-of). */
-  email?: string | string[];
+  email: string | string[];
   /** Control that advances from the email step to the password step. */
-  next?: string | string[];
+  next: string | string[];
   /** Password field selectors. */
-  password?: string | string[];
+  password: string | string[];
   /** Control that submits the password step. */
-  signIn?: string | string[];
-  success?: Condition;
-  error?: Condition;
+  signIn: string | string[];
+  success: Condition;
+  error: Condition;
   states?: Record<StateName, StateDef<LoginContext>>;
 }
 
-const DEFAULT_EMAIL = [
-  "input[type=email]",
-  "input[name*=email i]",
-  "input[id*=email i]",
-  "input[type=text]",
-];
-
-const DEFAULT_NEXT = ["button[type=submit]", "button"];
-
-const DEFAULT_PASSWORD = ["input[type=password]"];
-
-const DEFAULT_SIGN_IN = ["button[type=submit]", "button"];
-
 /**
  * Two-step login: email (then Next) -> password (then Sign in).
- * Override any selector set per site; extra states go through `states`.
+ * Every selector, the success/error conditions and the URLs must be given
+ * explicitly; there are no defaults.
  */
-export function twoStepLogin(opts: TwoStepOptions = {}): SiteAdapter {
-  const success: Condition =
-    opts.success ??
+export function twoStepLogin(opts: TwoStepOptions): SiteAdapter {
+  const steps: Step[] = [
+    ...(opts.consent
+      ? [
+          {
+            name: "CONSENT",
+            ready: opts.consent.ready,
+            submit: opts.consent.submit,
+            timeoutMs: opts.consent.timeoutMs,
+            optional: opts.consent.optional ?? false,
+          },
+        ]
+      : []),
     {
-      matches: async (ctx) =>
-        !(await visible(ctx.page, "input[type=password]")) && ctx.page.url() !== ctx.loginUrl,
-    };
+      name: "EMAIL",
+      ready: opts.email,
+      input: "email" as const,
+      submit: opts.next,
+    },
+    {
+      name: "PASSWORD",
+      ready: opts.password,
+      input: "password" as const,
+      submit: opts.signIn,
+    },
+  ];
 
   return {
-    id: opts.id ?? "two-step",
-    hosts: opts.hosts,
+    id: opts.id,
+    loginUrl: opts.loginUrl,
     destinationUrl: opts.destinationUrl,
-    steps: [
-      {
-        name: "EMAIL",
-        ready: opts.email ?? DEFAULT_EMAIL,
-        input: "username",
-        submit: opts.next ?? DEFAULT_NEXT,
-      },
-      {
-        name: "PASSWORD",
-        ready: opts.password ?? DEFAULT_PASSWORD,
-        input: "password",
-        submit: opts.signIn ?? DEFAULT_SIGN_IN,
-      },
-    ],
-    success,
-    error: opts.error ?? { selector: "[role=alert]" },
+    steps,
+    success: opts.success,
+    error: opts.error,
     states: opts.states,
   };
 }

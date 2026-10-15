@@ -152,6 +152,7 @@ fn run_supervisor(x: &x11::X11, cli: &Cli, rep: &Reporter, stop_all: &AtomicBool
                 json!({ "recording": false, "sessions": index, "output": cli.output }),
             ),
             Ok(Ctrl::Shutdown) => break,
+            Ok(Ctrl::Event { .. }) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }

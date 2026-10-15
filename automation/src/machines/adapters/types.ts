@@ -9,12 +9,14 @@ export interface LoginOptions {
   pollMs?: number;
 }
 
+export type Emit = (name: string, data?: Record<string, unknown>) => void;
+
 export interface LoginContext {
   page: Page;
   creds: Credentials;
-  url: string;
   opts: LoginOptions;
   adapter?: SiteAdapter;
+  emit?: Emit;
   loginUrl?: string;
   destinationUrl?: string;
   username?: Locator | null;
@@ -43,8 +45,8 @@ export interface Step {
   /** State name becomes STEP_<NAME>. */
   name: string;
   ready: ReadyCheck;
-  /** Fill username/password credential into the first visible ready selector. */
-  input?: "username" | "password";
+  /** Fill email/password credential into the first visible ready selector. */
+  input?: "email" | "password";
   /** Extra action; when set, it replaces the input fill. */
   action?: (ctx: LoginContext) => Promise<void>;
   /** Clicked after the input/action; Enter pressed on the input as fallback. */
@@ -57,8 +59,8 @@ export interface Step {
 
 export interface SiteAdapter {
   id: string;
-  /** Hostname matching for auto-selection. */
-  hosts?: RegExp | string[];
+  /** Entry point for login; the machine always navigates here first. */
+  loginUrl: string;
   /** Navigated to after authentication succeeds. */
   destinationUrl?: string;
   /** Start state; defaults to first step (or LOGIN_PAGE for state-only adapters). */

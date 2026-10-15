@@ -1,5 +1,6 @@
 import * as path from "path";
 import { StateDef, StateName } from "../../machine";
+import { clickHuman, pauseAction, pressHuman, typeHuman } from "../../human";
 import { BuiltMachine, LoginContext, SiteAdapter, Step } from "./types";
 import { conditionMet, firstVisible, selectorsOf, waitForReady } from "./selectors";
 
@@ -16,10 +17,12 @@ async function runStep(ctx: LoginContext, step: Step): Promise<void> {
   const timeoutMs = step.timeoutMs ?? STEP_TIMEOUT_MS;
   const pollMs = ctx.opts.pollMs ?? DEFAULT_POLL_MS;
 
+  ctx.emit?.("step", { phase: "start", step: step.name });
   const ready = await waitForReady(ctx, step.ready, timeoutMs, pollMs);
   if (!ready) {
     if (step.optional) {
       console.log(`[fsm] step ${step.name} skipped (not present)`);
+      ctx.emit?.("step", { phase: "skip", step: step.name });
       ctx.done?.add(step.name);
       return;
     }
@@ -28,11 +31,12 @@ async function runStep(ctx: LoginContext, step: Step): Promise<void> {
 
   const field = step.input ? await firstVisible(ctx.page, selectorsOf(step.ready) ?? []) : null;
 
+  await pauseAction();
   if (step.action) {
     await step.action(ctx);
   } else if (step.input && field) {
-    const value = step.input === "username" ? ctx.creds.username : ctx.creds.password;
-    await field.fill(value ?? "");
+    const value = step.input === "email" ? ctx.creds.email : ctx.creds.password;
+    await typeHuman(field, value ?? "");
   } else if (step.input) {
     throw new Error(`step ${step.name}: input steps need string/array selectors as ready`);
   }
@@ -42,15 +46,16 @@ async function runStep(ctx: LoginContext, step: Step): Promise<void> {
     const navigation = ctx.page
       .waitForLoadState("networkidle", { timeout: SUBMIT_SETTLE_MS })
       .catch(() => undefined);
-    if (submit) await submit.click();
-    else if (field) await field.press("Enter");
+    if (submit) await clickHuman(submit);
+    else if (field) await pressHuman(field, "Enter");
     else throw new Error(`step ${step.name}: no submit control`);
     await navigation;
   } else if (step.input === "password" && field) {
-    await field.press("Enter");
+    await pressHuman(field, "Enter");
   }
 
   ctx.done?.add(step.name);
+  ctx.emit?.("step", { phase: "done", step: step.name });
 }
 
 function stepStates(steps: Step[]): Record<StateName, StateDef<LoginContext>> {
@@ -67,11 +72,12 @@ function stepStates(steps: Step[]): Record<StateName, StateDef<LoginContext>> {
   return states;
 }
 
-function openLoginState(firstStep: StateName): StateDef<LoginContext> {
+function openLoginState(loginUrl: string, firstStep: StateName): StateDef<LoginContext> {
   return {
     action: async (ctx) => {
-      if (ctx.page.url() !== ctx.url) {
-        await ctx.page.goto(ctx.url, { waitUntil: "domcontentloaded" });
+      if (ctx.page.url() !== loginUrl) {
+        await pauseAction();
+        await ctx.page.goto(loginUrl, { waitUntil: "domcontentloaded" });
       }
       ctx.loginUrl = ctx.page.url();
     },
@@ -125,7 +131,7 @@ export function buildLoginMachine(adapter: SiteAdapter): BuiltMachine {
   const firstStep = steps.length ? `STEP_${steps[0].name}` : "LOGIN_PAGE";
 
   const states: Record<StateName, StateDef<LoginContext>> = {
-    ...(steps.length ? { GOTO_LOGIN: openLoginState(firstStep) } : {}),
+    ...(steps.length ? { GOTO_LOGIN: openLoginState(adapter.loginUrl, firstStep) } : {}),
     ...stepStates(steps),
     ...sharedStates(adapter),
     ...(adapter.states ?? {}),

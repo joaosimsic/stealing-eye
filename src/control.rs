@@ -28,6 +28,12 @@ pub enum Command {
     Stop,
     Status,
     Shutdown,
+    /// Broadcast a structured event to every connected client.
+    Event {
+        name: String,
+        #[serde(default)]
+        data: Value,
+    },
 }
 
 pub struct Hub {
@@ -166,6 +172,7 @@ fn handle_line(line: &str, tx: &Sender<Command>, hub: &Hub) {
         return;
     }
     match serde_json::from_str::<Command>(trimmed) {
+        Ok(Command::Event { name, data }) => hub.emit(&name, data),
         Ok(cmd) => {
             if tx.send(cmd).is_err() {
                 hub.emit("error", json!({ "message": "supervisor not running" }));
