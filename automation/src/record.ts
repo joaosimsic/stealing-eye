@@ -7,6 +7,7 @@ import { runLoginMachine } from "./machines/login";
 interface Opts {
   socket: string;
   url: string | null;
+  site?: string;
   minDuration: number;
   minAreaRatio: number;
   stopDebounceMs: number;
@@ -31,6 +32,7 @@ function parseArgs(argv: string[]): Opts {
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--socket") opts.socket = argv[++i];
+    else if (a === "--site") opts.site = argv[++i];
     else if (a === "--min-duration") opts.minDuration = Number(argv[++i]);
     else if (a === "--min-area") opts.minAreaRatio = Number(argv[++i]);
     else if (a === "--stop-debounce") opts.stopDebounceMs = Number(argv[++i]);
@@ -161,7 +163,8 @@ async function main(): Promise<void> {
   const page = await context.newPage();
   if (url) {
     if (hasCreds) {
-      const finalState = await runLoginMachine({ page, creds, url, opts: envLoginOptions() });
+      const loginOpts = { ...envLoginOptions(), ...(opts.site ? { site: opts.site } : {}) };
+      const finalState = await runLoginMachine({ page, creds, url, opts: loginOpts });
       if (finalState !== "AUTHENTICATED") {
         console.warn(`login ended in ${finalState}; watching anyway (Ctrl-C to quit)`);
       }

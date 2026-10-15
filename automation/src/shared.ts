@@ -68,15 +68,11 @@ export async function launchBrowser(): Promise<Browser> {
 }
 
 export interface LoginEnvOptions {
-  destinationUrl?: string;
-  successSelector?: string;
-  errorSelector?: string;
+  site?: string;
 }
 
 export function envLoginOptions(): LoginEnvOptions {
   return {
-    destinationUrl: process.env.DESTINATION_URL || undefined,
-    successSelector: process.env.LOGIN_SUCCESS_SELECTOR || undefined,
-    errorSelector: process.env.LOGIN_ERROR_SELECTOR || undefined,
+    site: process.env.SITE || undefined,
   };
 }
