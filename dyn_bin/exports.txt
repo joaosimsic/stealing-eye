@@ -1,0 +1,5 @@
+     5: 0000000000fb0ed0    90 FUNC    GLOBAL DEFAULT   12 InitializeCdmModule_4
+     6: 0000000000fb0f30    81 FUNC    GLOBAL DEFAULT   12 DeinitializeCdmModule
+     7: 0000000000fb0f90   511 FUNC    GLOBAL DEFAULT   12 CreateCdmInstance
+     8: 0000000000fb1190    13 FUNC    GLOBAL DEFAULT   12 GetCdmVersion
+     9: 0000000000fb11a0     8 FUNC    GLOBAL DEFAULT   12 VerifyCdmHost_0
